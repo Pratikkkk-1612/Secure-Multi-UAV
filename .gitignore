@@ -1,0 +1,22 @@
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local credentials
+.env
+.env.*
+
+# IDE files
+.vscode/
+.idea/
+
+# Training artifacts
+*.pt
+*.pth
+*.ckpt
