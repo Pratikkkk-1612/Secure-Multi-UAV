@@ -8,8 +8,8 @@ from gymnasium import spaces
 from pettingzoo import ParallelEnv
 
 from config import DEFAULT_CONFIG, ProjectConfig
-from channels.a2g_channel import a2g_sinr, expected_a2g_gain, sample_a2g
-from channels.a2a_channel import a2a_eav_sinr_rb, sample_a2a
+from channels.a2g_channel import expected_a2g_gain
+from network_model import NetworkMetrics, NetworkModel
 
 
 GU_GRID_ROWS = 10
@@ -226,7 +226,7 @@ class SAGINMultiUAVEnv(ParallelEnv):
             raise ValueError("spawn_layout must be 'random' or 'spread'")
         if eav_policy not in ("random", "pursuit"):
             raise ValueError("eav_policy must be 'random' or 'pursuit'")
-        if reward_mode not in ("absolute"):
+        if reward_mode != "absolute":
             raise ValueError("reward_mode must be 'absolute'")
         if collision_distance_m < 0 or not np.isfinite(collision_distance_m):
             raise ValueError("collision_distance_m must be nonnegative and finite")
@@ -265,15 +265,6 @@ class SAGINMultiUAVEnv(ParallelEnv):
         self.max_steps = self.net.n_steps
         self.rb_bandwidth_hz = config.a2g.resource_block_bandwidth_hz
         self.rate_scale_bps = self.rb_bandwidth_hz * self.n_gu
-        self._a2g_config = config.a2g
-        self._state_dim = GLOBAL_OBSERVATION_DIM
-
-        self._lower_uav, self._upper_uav = self._motion_bounds(is_eav=False)
-        self._lower_eav, self._upper_eav = self._motion_bounds(is_eav=True)
-        self._gu_lower = np.array([0.0, 0.0, self.net.gu_altitude_m])
-        self._gu_upper = np.array([
-            self.net.area_x_m, self.net.area_y_m, self.net.gu_altitude_m,
-        ])
         self.possible_agents = [f"uav_{i}" for i in range(self.n_uav)]
         self.agents = []
         self._act_space = spaces.Box(-1.0, 1.0, shape=(self.action_dim,), dtype=np.float32)
@@ -285,7 +276,7 @@ class SAGINMultiUAVEnv(ParallelEnv):
         )
         self.action_spaces = {a: self._act_space for a in self.possible_agents}
         self.observation_spaces = {a: self._obs_space for a in self.possible_agents}
-        self._rng = np.random.default_rng()
+        self.network: NetworkModel | None = None
 
         self.uav_pos: np.ndarray | None = None
         self.uav_vel: np.ndarray | None = None
@@ -300,21 +291,10 @@ class SAGINMultiUAVEnv(ParallelEnv):
         self.power_sum_w_steps = np.zeros(self.n_uav, dtype=np.float64)
         self.secrecy_rate_per_uav_bps = np.zeros(self.n_uav, dtype=np.float64)
         self._last_secrecy_bps = 0.0
-        self._last_secrecy_per_uav_bps = np.zeros(self.n_uav, dtype=np.float64)
         self.latest_metrics: dict = {}
         self._channel_features = np.zeros(12, dtype=np.float32)
         self._gu_grid_features = np.zeros(300, dtype=np.float32)
 
-
-    def _motion_bounds(self, *, is_eav: bool) -> tuple[np.ndarray, np.ndarray]:
-        if self.net.mobility_mode == "2d":
-            zlo = zhi = self.net.fixed_2d_altitude_m
-        elif is_eav:
-            zlo, zhi = self.net.eav_3d_altitude_limits_m
-        else:
-            zlo, zhi = self.net.uav_3d_altitude_limits_m
-        return (np.array([0.0, 0.0, zlo], dtype=np.float64),
-                np.array([self.net.area_x_m, self.net.area_y_m, zhi], dtype=np.float64))
 
     def _local_observation(self, uav_index: int) -> np.ndarray:
         i = uav_index
@@ -406,139 +386,35 @@ class SAGINMultiUAVEnv(ParallelEnv):
     def action_space(self, agent: str) -> spaces.Box:
         return self.action_spaces[agent]
 
-    def _spawn(self, n: int, altitude: float, *, spread: bool = False) -> np.ndarray:
-        if n == 0:
-            return np.empty((0, 3), dtype=np.float64)
-        if spread:
-            columns = int(np.ceil(np.sqrt(n)))
-            rows = int(np.ceil(n / columns))
-            xs = (np.arange(columns) + 0.5) * self.net.area_x_m / columns
-            ys = (np.arange(rows) + 0.5) * self.net.area_y_m / rows
-            xy = np.array([(x, y) for y in ys for x in xs], dtype=np.float64)[:n]
-        else:
-            xy = self._rng.uniform([0.0, 0.0],
-                                   [self.net.area_x_m, self.net.area_y_m], size=(n, 2))
-        return np.column_stack([xy, np.full(n, altitude)])
-
-    def _random_velocities(self, n: int, speed: float, dim: int) -> np.ndarray:
-        v = np.zeros((n, 3), dtype=np.float64)
-        if speed == 0 or n == 0:
-            return v
-        directions = self._rng.normal(size=(n, dim))
-        directions /= np.maximum(np.linalg.norm(directions, axis=1, keepdims=True), 1e-12)
-        v[:, :dim] = directions * speed
-        return v
-
-    def _reflect(self, pos: np.ndarray, vel: np.ndarray,
-                 lower: np.ndarray, upper: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-
-        nxt = pos + vel * self.dt_s
-        newvel = vel.copy()
-        for k in range(3):
-            lo, hi = lower[k], upper[k]
-            if hi == lo:
-                nxt[:, k] = lo
-                newvel[:, k] = 0.0
-                continue
-
-            span = hi - lo
-            offset = nxt[:, k] - lo
-            phase = np.mod(offset, 2.0 * span)
-            nxt[:, k] = lo + np.where(phase <= span, phase, 2.0 * span - phase)
-            crossing = np.floor(offset / span).astype(np.int64)
-            newvel[:, k] *= np.where(crossing % 2 == 0, 1.0, -1.0)
-        return nxt, newvel
-
-    def _associate_and_schedule(self) -> None:
-
-        distances = np.linalg.norm(self.uav_pos[:, None, :] - self.gu_pos[None, :, :], axis=-1)
-        association = np.argmin(distances, axis=0)
-        counts = np.bincount(association, minlength=self.n_uav)
-        low, high = self.net.min_gu_per_uav, self.net.max_gu_per_uav
-
-
-        while np.any(counts > high):
-            src = int(np.argmax(counts - high))
-            movable = np.flatnonzero(association == src)
-            destinations = np.flatnonzero(counts < high)
-            penalties = distances[np.ix_(destinations, movable)] - distances[src, movable]
-            d, u = np.unravel_index(np.argmin(penalties), penalties.shape)
-            dst, gu = int(destinations[d]), int(movable[u])
-            association[gu] = dst
-            counts[src] -= 1
-            counts[dst] += 1
-
-
-        while np.any(counts < low):
-            dst = int(np.flatnonzero(counts < low)[0])
-            movable = np.flatnonzero(counts[association] > low)
-            if len(movable) == 0:
-                raise RuntimeError("User association is infeasible under current constraints")
-            penalties = distances[dst, movable] - distances[association[movable], movable]
-            gu = int(movable[np.argmin(penalties)])
-            src = int(association[gu])
-            association[gu] = dst
-            counts[src] -= 1
-            counts[dst] += 1
-
-        schedule = np.zeros((self.n_uav, self.n_rb), dtype=np.int64)
-        for i in range(self.n_uav):
-            users = np.flatnonzero(association == i)
-            if len(users) > self.n_rb:
-                raise RuntimeError("Too many users for a UAV's available resource blocks")
-            schedule[i, :len(users)] = users + 1
-        self.assigned_uav = association
-        self.scheduled_gu = schedule
-
-
-    def _eavesdropper_rates(self, a2a_state) -> np.ndarray:
-
-        sinr = a2a_eav_sinr_rb(
-            a2a_state, self.scheduled_gu, self.uav_power_w,
-            config=self.config.a2a,
-        )
-        worst_rate = self.rb_bandwidth_hz * np.log2(1.0 + sinr).max(axis=1)
-        uav_indices, rb_indices = np.nonzero(self.scheduled_gu)
-        gu_indices = self.scheduled_gu[uav_indices, rb_indices] - 1
-        result = np.zeros(self.n_gu, dtype=np.float64)
-        result[gu_indices] = worst_rate[uav_indices, rb_indices]
-        return result
-
-    def _calculate_metrics(self) -> dict:
-
-        ground = sample_a2g(
-            self.uav_pos, self.gu_pos, config=self.config.a2g, rng=self._rng,
-        )
-        air = sample_a2a(
-            self.uav_pos, self.eav_pos, self.uav_vel, self.eav_vel,
-            self.current_step * self.dt_s, config=self.config.a2a, rng=self._rng,
-        )
+    def _observe_network(self, metrics: NetworkMetrics) -> None:
+        model = self.network
+        self.current_step = model.step_count
+        self.uav_pos, self.uav_vel = model.uav_pos, model.uav_vel
+        self.eav_pos, self.eav_vel = model.eav_pos, model.eav_vel
+        self.gu_pos, self.gu_vel = model.gu_pos, model.gu_vel
+        self.uav_power_w = model.power_w
+        self.power_sum_w_steps = model.power_sum_w_steps
+        self.assigned_uav, self.scheduled_gu = metrics.association, metrics.schedule
         self._channel_features = build_channel_features(
             self.uav_pos, self.gu_pos, self.assigned_uav,
-            air.uav_eav.large_scale_gain, config=self.config,
+            metrics.a2a_state.uav_eav.large_scale_gain, config=self.config,
         )
-        self._gu_grid_features = build_gu_grid_features(
-            self.gu_pos, self.gu_vel, config=self.config,
-        )
-        gu_sinr = a2g_sinr(
-            ground, self.scheduled_gu, self.uav_power_w, config=self.config.a2g,
-        )
-        gu_rates = self.rb_bandwidth_hz * np.log2(1.0 + np.maximum(gu_sinr, 0.0))
-        eve_rates = self._eavesdropper_rates(air)
-        secrecy_rates = np.maximum(gu_rates - eve_rates, 0.0)
-        self.secrecy_rate_per_uav_bps = np.bincount(
-            self.assigned_uav, weights=secrecy_rates, minlength=self.n_uav,
-        )
+        self._gu_grid_features = build_gu_grid_features(self.gu_pos, self.gu_vel, config=self.config)
+        security = metrics.security
+        self.secrecy_rate_per_uav_bps = security.per_uav_secrecy_rate_bps
+        self._last_secrecy_bps = security.total_secrecy_rate_bps
         threshold = 10.0 ** (self.config.a2g.outage_sinr_threshold_db / 10.0)
-        return {
-            "global_sum_rate_bps": float(gu_rates.sum()),
-            "secrecy_sum_rate_bps": float(secrecy_rates.sum()),
-            "eavesdropper_sum_rate_bps": float(eve_rates.sum()),
-            "coverage_fraction": float(np.mean(gu_sinr >= threshold)),
+        self.latest_metrics = {
+            "global_sum_rate_bps": metrics.total_rate_bps,
+            "secrecy_sum_rate_bps": security.total_secrecy_rate_bps,
+            "mean_secrecy_rate_bps_per_gu": security.mean_secrecy_rate_bps,
+            "eavesdropper_sum_rate_bps": float(security.per_uav_worst_eav_rate_bps.sum()),
+            "worst_eav_index_per_uav": security.worst_eav_index.copy(),
+            "per_uav_eav_rate_bps": security.per_uav_eav_rate_bps.copy(),
+            "coverage_fraction": float(np.mean(metrics.gu_sinr >= threshold)),
             "users_per_uav": np.bincount(self.assigned_uav, minlength=self.n_uav),
             "per_uav_secrecy_rate_bps": self.secrecy_rate_per_uav_bps.copy(),
         }
-
 
     def _global_state(self) -> np.ndarray:
         return build_global_observation(
@@ -570,26 +446,16 @@ class SAGINMultiUAVEnv(ParallelEnv):
 
 
     def reset(self, seed: int | None = None, options: dict | None = None):
-        if seed is not None:
-            self._rng = np.random.default_rng(seed)
         self.agents = self.possible_agents.copy()
-        self.current_step = 0
-        self.power_sum_w_steps[:] = 0.0
-
-        self.uav_pos = self._spawn(self.n_uav, self.net.uav_altitude_m,
-                                   spread=self.spawn_layout == "spread")
-        self.uav_vel = np.zeros((self.n_uav, 3), dtype=np.float64)
-        self.gu_pos = self._spawn(self.n_gu, self.net.gu_altitude_m)
-        self.gu_vel = self._random_velocities(self.n_gu, self.net.gu_speed_mps, 2)
-        self.eav_pos = self._spawn(self.n_eav, self.net.eav_altitude_m)
-        self.eav_vel = self._random_velocities(
-            self.n_eav, self.net.eav_speed_mps, self.movement_dim,
-        )
-        self.uav_power_w = np.full(self.n_uav, self.sec.initial_uav_power_w)
-        self._associate_and_schedule()
-        self.latest_metrics = self._calculate_metrics()
-        self._last_secrecy_bps = self.latest_metrics["secrecy_sum_rate_bps"]
-        self._last_secrecy_per_uav_bps = self.secrecy_rate_per_uav_bps.copy()
+        if self.network is None:
+            self.network = NetworkModel(
+                self.config, seed=seed, spawn_layout=self.spawn_layout, eav_policy=self.eav_policy,
+                enforce_average_power_budget=self.enforce_average_power_budget,
+            )
+            metrics = self.network.last_metrics
+        else:
+            metrics = self.network.reset(seed)
+        self._observe_network(metrics)
         return self._observations(), {agent: {} for agent in self.agents}
 
     def step(self, actions: dict[str, np.ndarray]):
@@ -598,64 +464,10 @@ class SAGINMultiUAVEnv(ParallelEnv):
         if set(actions) != set(self.agents):
             raise ValueError("Provide exactly one action for each active UAV")
         raw = np.stack([np.asarray(actions[a], dtype=np.float64) for a in self.agents])
-        if raw.shape != (self.n_uav, self.action_dim) or not np.all(np.isfinite(raw)):
-            raise ValueError(f"Actions must be finite vectors of shape ({self.action_dim},)")
-        raw = np.clip(raw, -1.0, 1.0)
-
-
-        movement = raw[:, :self.movement_dim].copy()
-        movement /= np.maximum(1.0, np.linalg.norm(movement, axis=1, keepdims=True))
-        requested_vel = np.zeros_like(self.uav_vel)
-        requested_vel[:, :self.movement_dim] = movement * self.net.uav_max_speed_mps
-        proposed = self.uav_pos + requested_vel * self.dt_s
-        boundary_violation = np.any(
-            (proposed < self._lower_uav) | (proposed > self._upper_uav), axis=1,
-        )
-        updated = np.clip(proposed, self._lower_uav, self._upper_uav)
-        self.uav_vel = (updated - self.uav_pos) / self.dt_s
-        self.uav_pos = updated
-
-
-        self.uav_power_w = self.sec.min_uav_power_w + (
-            (raw[:, -1] + 1.0) / 2.0
-            * (self.sec.max_uav_power_w - self.sec.min_uav_power_w)
-        )
-        if self.enforce_average_power_budget:
-            steps_after_this = self.max_steps - self.current_step - 1
-            remaining_budget = (
-                self.max_steps * self.sec.average_uav_power_budget_w
-                - self.power_sum_w_steps
-                - steps_after_this * self.sec.min_uav_power_w
-            )
-
-            self.uav_power_w = np.maximum(
-                self.sec.min_uav_power_w,
-                np.minimum(self.uav_power_w, remaining_budget),
-            )
-        self.power_sum_w_steps += self.uav_power_w
-
-        self.gu_pos, self.gu_vel = self._reflect(
-            self.gu_pos, self.gu_vel, self._gu_lower, self._gu_upper,
-        )
-        if self.n_eav:
-            if self.eav_policy == "pursuit":
-                diff = self.uav_pos[None, :, :] - self.eav_pos[:, None, :]
-                nearest = np.linalg.norm(diff, axis=-1).argmin(axis=1)
-                direction = diff[np.arange(self.n_eav), nearest]
-                if self.movement_dim == 2:
-                    direction[:, 2] = 0.0
-                direction /= np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-12)
-                self.eav_vel = direction * self.net.eav_speed_mps
-            self.eav_pos, self.eav_vel = self._reflect(
-                self.eav_pos, self.eav_vel, self._lower_eav, self._upper_eav,
-            )
-
-        self.current_step += 1
-        self._associate_and_schedule()
-        metrics = self._calculate_metrics()
+        self._observe_network(self.network.step(raw))
+        boundary_violation = self.network.boundary_violations
+        metrics = self.latest_metrics
         secrecy = metrics["secrecy_sum_rate_bps"]
-        self._last_secrecy_bps = secrecy
-        self.latest_metrics = metrics
 
         if self.shared_reward:
             reward = np.full(
@@ -665,10 +477,8 @@ class SAGINMultiUAVEnv(ParallelEnv):
         else:
             reward = (
                 self.weights.secrecy
-        * self.n_uav
-        * metrics["per_uav_secrecy_rate_bps"]
-        / self.rate_scale_bps
-    )
+                * self.n_uav * metrics["per_uav_secrecy_rate_bps"] / self.rate_scale_bps
+            )
         power_denominator = max(self.sec.max_uav_power_w, 1e-30)
         reward -= self.weights.power * self.uav_power_w / power_denominator
         reward -= self.weights.boundary * boundary_violation.astype(float)
@@ -686,8 +496,9 @@ class SAGINMultiUAVEnv(ParallelEnv):
         done = self.current_step >= self.max_steps
         rewards = {a: float(reward[i]) for i, a in enumerate(self.agents)}
 
-        terminations = {a: False for a in self.agents}
-        truncations = {a: done for a in self.agents}
+        # Time and the power budget are part of this finite-horizon task.
+        terminations = {a: done for a in self.agents}
+        truncations = {a: False for a in self.agents}
         infos = {
             a: {
                 "global_sum_rate_bps": metrics["global_sum_rate_bps"],

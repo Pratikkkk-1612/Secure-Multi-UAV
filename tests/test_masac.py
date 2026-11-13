@@ -394,3 +394,31 @@ def test_masac_environment_integration():
     finally:
         env.close()
 
+
+
+def test_masac_bootstraps_on_external_cutoff_only(monkeypatch):
+    import numpy as np
+    import reinforcement_learning.masac as algorithm
+    from reinforcement_learning.replay_buffer import ReplayBuffer
+
+    learner = algorithm.MASAC(n_agents=1, state_dim=1, local_obs_dim=1,
+                              action_dim=1, hidden_dim=4, gamma=0.5)
+    # Constant target Q = 4; alpha tends to zero so the exact targets are 1 and 3.
+    for critic in (learner.target_critics1[0], learner.target_critics2[0]):
+        for param in critic.parameters():
+            param.zero_()
+        critic.net[-1].bias.fill_(4)
+    learner.temperatures[0].log_alpha.data.fill_(-100)
+    buffer = ReplayBuffer(2, state_dim=1, local_obs_dim=1, action_dim=1,
+                          agent_names=learner.agent_names)
+    for terminal in (True, False):
+        state = np.array([float(terminal)], dtype=np.float32)
+        obs = {"uav_0": state}
+        buffer.add(state, obs, obs, {"uav_0": 1.0}, state, obs,
+                   {"uav_0": terminal}, {"uav_0": not terminal})
+    def check_targets(states, actions, targets, *args):
+        torch.testing.assert_close(targets, 3.0 - 2.0 * states)
+        return 0.0
+
+    monkeypatch.setattr(algorithm, "update_critics", check_targets)
+    learner.update(buffer, batch_size=2)

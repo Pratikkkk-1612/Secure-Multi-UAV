@@ -76,7 +76,7 @@ def compute_critic_target(
     next_states,
     next_local_obs,
     rewards,
-    dones,
+    terminations,
     actors,
     target_critic1,
     target_critic2,
@@ -123,7 +123,7 @@ def compute_critic_target(
     target = (
         rewards[:, agent_index:agent_index + 1]
         + gamma
-        * (1.0 - dones[:, agent_index:agent_index + 1].float())
+        * (1.0 - terminations[:, agent_index:agent_index + 1].float())
         * future_value
     )
 
@@ -460,7 +460,7 @@ class MASAC(nn.Module):
 
         next_states = batch["next_states"].to(self.device)
         next_observations = batch["next_observations"].to(self.device)
-        dones = batch["dones"].to(self.device)
+        terminations = batch["terminations"].to(self.device)
 
         metrics = {
             "critic_loss": [],
@@ -478,7 +478,7 @@ class MASAC(nn.Module):
                 next_states=next_states,
                 next_local_obs=next_observations,
                 rewards=rewards,
-                dones=dones,
+                terminations=terminations,
                 actors=self.actors,
                 target_critic1=self.target_critics1[i],
                 target_critic2=self.target_critics2[i],

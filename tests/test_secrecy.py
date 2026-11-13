@@ -90,6 +90,35 @@ class TestSecrecy(unittest.TestCase):
         assert_allclose(r.mean_secrecy_rate_bps, r.total_secrecy_rate_bps/2)
         assert_allclose(r.transmit_weights[case[2] == 0], 0)
 
+    def test_select_listener_after_summing_and_clip_once_per_uav(self):
+        # UAV 1 interferes only on RB 0. For UAV 0 the best listener flips
+        # between blocks, and one GU has zero legitimate throughput.
+        case = _case(
+            [[[0, 0], [4, 0], [1, 0]], [[1, 0], [1, 0], [2, 0]]],
+            [[[2, 0], [1, 0]], [[8, 0], [0, 0]]],
+            [[1, 2], [3, 0]], [0.2, 0.1],
+        )
+        result = _evaluate(case)
+        bw = case[4].a2g.resource_block_bandwidth_hz
+        listener_rates = bw * np.log2(1 + result.eav_sinr[:2])
+        self.assertEqual(list(listener_rates.argmax(axis=1)), [1, 0])
+        leakage = listener_rates.sum(axis=0).max()
+        self.assertLess(leakage, listener_rates.max(axis=1).sum())
+        assert_allclose(result.per_uav_worst_eav_rate_bps[0], leakage)
+        expected = max(result.gu_rate_bps[:2].sum() - leakage, 0)
+        assert_allclose(result.per_uav_secrecy_rate_bps[0], expected)
+        self.assertGreater(result.secrecy_rate_bps[:2].sum(), expected)
+
+    def test_pooled_objective_is_positive_and_independent_of_gu_identifiers(self):
+        case = _case([[[0, 0], [4, 0]]], [[[1e-4, 0]]], [[1, 2]], 0.2)
+        result = _evaluate(case)
+        pooled = result.gu_rate_bps.sum() - result.per_uav_eav_rate_bps[0, 0]
+        self.assertGreater(pooled, 0)
+        assert_allclose(result.total_secrecy_rate_bps, pooled)
+        self.assertGreater(result.secrecy_rate_bps.sum(), pooled)
+        relabeled = _case([[[4, 0], [0, 0]]], [[[1e-4, 0]]], [[2, 1]], 0.2)
+        assert_allclose(_evaluate(relabeled).total_secrecy_rate_bps, pooled)
+
     def test_invalid_power_schedule_and_channels(self):
         case = _case([[[2, 0]]], [[[1, 0]]], [[1]], 0.1)
         for bad in (-0.01, 0.5, float("nan")):

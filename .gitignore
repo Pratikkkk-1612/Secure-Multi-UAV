@@ -20,3 +20,4 @@ venv/
 *.pt
 *.pth
 *.ckpt
+/runs/

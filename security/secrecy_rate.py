@@ -7,6 +7,11 @@ from config import DEFAULT_CONFIG, ProjectConfig
 
 @dataclass(frozen=True)
 class SecurityMetrics:
+    """One slot. GU-indexed rates are stream diagnostics for the selected listener.
+
+    secrecy_rate_bps clips each stream separately for diagnostics only. The
+    training objective clips once per UAV, after summing all its streams.
+    """
     legitimate_sinr: np.ndarray
     eav_sinr: np.ndarray
     gu_rate_bps: np.ndarray
@@ -15,13 +20,18 @@ class SecurityMetrics:
     per_uav_secrecy_rate_bps: np.ndarray
     transmit_weights: np.ndarray
 
+    per_uav_gu_rate_bps: np.ndarray
+    per_uav_eav_rate_bps: np.ndarray       # (UAV, EAV), summed over active RBs
+    worst_eav_index: np.ndarray            # (UAV,), -1 when no EAV is present
+    per_uav_worst_eav_rate_bps: np.ndarray
+
     @property
     def total_secrecy_rate_bps(self) -> float:
-        return float(self.secrecy_rate_bps.sum())
+        return float(self.per_uav_secrecy_rate_bps.sum())
 
     @property
     def mean_secrecy_rate_bps(self) -> float:
-        return float(self.secrecy_rate_bps.mean())
+        return self.total_secrecy_rate_bps / len(self.gu_rate_bps)
 
 
 def evaluate_security(
@@ -32,9 +42,17 @@ def evaluate_security(
     *,
     config: ProjectConfig | None = None,
 ) -> SecurityMetrics:
+    """Aggregate each non-colluding listener over the UAV's active RBs.
+
+    The normalized network total is an aggregate throughput metric. It does
+    not quantify the secrecy of each user's independently encoded message.
+    """
     cfg = config if config is not None else DEFAULT_CONFIG
     hg = np.asarray(a2g_state.h, dtype=complex)
-    he = np.asarray(a2a_state.uav_eav.h, dtype=complex)
+    if a2a_state is None and cfg.network.n_eav == 0:
+        he = np.empty((cfg.network.n_uav, 0, cfg.security.n_tx_antennas), dtype=complex)
+    else:
+        he = np.asarray(a2a_state.uav_eav.h, dtype=complex)
     if (
         hg.ndim != 3 or he.ndim != 3
         or hg.shape[0] != he.shape[0]
@@ -90,40 +108,45 @@ def evaluate_security(
     bandwidth = cfg.a2g.resource_block_bandwidth_hz
     noise_gu = cfg.a2g.noise_power_w
     noise_eav = cfg.a2a.rb_noise_power_w
-    legitimate_sinr = np.zeros(n_gu)
-    eav_sinr = np.zeros((n_gu, n_eav))
+    # The schedule determines interference and bandwidth, but the listener
+    # is selected once per transmitting UAV after accumulating every active RB.
+    uav, rb = np.nonzero(schedule)
+    gu = schedule[uav, rb] - 1
     serving_uav = np.empty(n_gu, dtype=int)
-
-    for rb in range(n_rb):
-        active = np.flatnonzero(schedule[:, rb])
-        if active.size == 0:
-            continue
-        gu = schedule[active, rb] - 1
-        serving_uav[gu] = active
-
-        # Only simultaneous transmissions on this RB contribute interference.
-        received_gu = power_per_rb[active, None] * gain_gu[np.ix_(active, gu)]
-        desired = np.diag(received_gu)
-        interference = np.maximum(received_gu.sum(axis=0) - desired, 0.0)
-        legitimate_sinr[gu] = desired / (interference + noise_gu)
-
-        if n_eav:
-            received_eav = power_per_rb[active, None] * gain_eav[active]
-            interference_eav = np.maximum(
-                received_eav.sum(axis=0, keepdims=True) - received_eav, 0.0
-            )
-            eav_sinr[gu] = received_eav / (interference_eav + noise_eav)
-
+    serving_uav[gu] = uav
+    rb_of_gu = np.empty(n_gu, dtype=int)
+    rb_of_gu[gu] = rb
+    active = schedule > 0
+    received_gu = power_per_rb[:, None] * gain_gu * active[:, rb_of_gu]
+    desired = received_gu[serving_uav, np.arange(n_gu)]
+    interference = np.maximum(received_gu.sum(axis=0) - desired, 0.0)
+    legitimate_sinr = desired / (interference + noise_gu)
     gu_rate = bandwidth * np.log2(1.0 + legitimate_sinr)
-    worst_eav_rate = (
-        bandwidth * np.log2(1.0 + eav_sinr.max(axis=1))
-        if n_eav else np.zeros(n_gu)
-    )
-    secrecy_rate = np.maximum(gu_rate - worst_eav_rate, 0.0)
-    per_uav_rate = np.bincount(
-        serving_uav, weights=secrecy_rate, minlength=n_uav
-    )
+    per_uav_gu = np.bincount(serving_uav, weights=gu_rate, minlength=n_uav)
+
+    received = (power_per_rb[:, None] * gain_eav)[:, :, None] * active[:, None, :]
+    interference = np.maximum(received.sum(axis=0, keepdims=True) - received, 0.0)
+    sinr = received / (interference + noise_eav)
+    rb_rates = bandwidth * np.log2(1.0 + sinr)
+    listener_rates = rb_rates.sum(axis=2)
+    selected = np.full(n_uav, -1, dtype=int)
+    leakage = np.zeros(n_uav)
+    stream_leakage = np.zeros(n_gu)
+    if n_eav:
+        selected = listener_rates.argmax(axis=1)
+        leakage = listener_rates[np.arange(n_uav), selected]
+        stream_leakage[gu] = rb_rates[uav, selected[uav], rb]
+
     return SecurityMetrics(
-        legitimate_sinr, eav_sinr, gu_rate, worst_eav_rate,
-        secrecy_rate, per_uav_rate, weights,
+        legitimate_sinr=legitimate_sinr,
+        eav_sinr=sinr[serving_uav, :, rb_of_gu],
+        gu_rate_bps=gu_rate,
+        worst_eav_rate_bps=stream_leakage,
+        secrecy_rate_bps=np.maximum(gu_rate - stream_leakage, 0.0),
+        per_uav_secrecy_rate_bps=np.maximum(per_uav_gu - leakage, 0.0),
+        transmit_weights=weights,
+        per_uav_gu_rate_bps=per_uav_gu,
+        per_uav_eav_rate_bps=listener_rates,
+        worst_eav_index=selected,
+        per_uav_worst_eav_rate_bps=leakage,
     )

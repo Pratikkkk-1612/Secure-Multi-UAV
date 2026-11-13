@@ -76,6 +76,7 @@ def test_user_association_and_scheduling(model):
 
 
 def test_mobility_and_power_actions(model):
+    model.enforce_average_power_budget = False  # isolate the peak-power mapping
     before = model.uav_pos.copy()
     actions = np.zeros((model.net.n_uav, model.config.action_dimensions_per_uav))
     actions[:, 0] = 1.0
@@ -111,7 +112,8 @@ def test_rates_and_secrecy(model):
         assert np.all(np.isfinite(values) & (values >= 0))
 
     assert metrics.total_rate_bps == pytest.approx(metrics.gu_rate_bps.sum())
-    assert metrics.total_secrecy_bps == pytest.approx(metrics.secrecy_rate_bps.sum())
+    expected = np.maximum(metrics.security.per_uav_gu_rate_bps - metrics.security.per_uav_eav_rate_bps.max(axis=1), 0.0)
+    np.testing.assert_allclose(metrics.per_uav_secrecy_bps, expected)
     assert metrics.total_secrecy_bps == pytest.approx(metrics.per_uav_secrecy_bps.sum())
     assert np.all(metrics.secrecy_rate_bps <= metrics.gu_rate_bps + 1e-9)
     assert metrics.a2g_state is not None

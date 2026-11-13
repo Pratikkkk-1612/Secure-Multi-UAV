@@ -1,7 +1,6 @@
 """Focused tests for the continuous-action Secure Multi-UAV SAGIN environment."""
 
 from dataclasses import replace
-from types import SimpleNamespace
 import numpy as np
 import pytest
 
@@ -17,6 +16,11 @@ def _actions(env, power_action=-1.0):
         action[-1] = power_action
         actions[agent] = action
     return actions
+
+
+def test_partial_reward_mode_is_rejected():
+    with pytest.raises(ValueError, match="reward_mode"):
+        SAGINMultiUAVEnv(reward_mode="abs")
 
 
 def test_reset_is_reproducible_and_observations_are_valid():
@@ -89,8 +93,8 @@ def test_episode_end_and_average_power_budget():
         observations, rewards, terminations, truncations, infos = env.step(
             _actions(env, power_action=1.0)
         )
-        assert all(not finished for finished in terminations.values())
-        assert all(finished == (step == env.max_steps - 1) for finished in truncations.values())
+        assert all(finished == (step == env.max_steps - 1) for finished in terminations.values())
+        assert not any(truncations.values())
 
 
     assert env.agents == []
@@ -119,126 +123,21 @@ def test_invalid_actions_are_rejected():
         env.step(bad)
     env.close()
 
-def test_eav_interception_rate():
+def test_uav_level_secrecy_drives_environment_reward():
     env = SAGINMultiUAVEnv()
     env.reset(seed=42)
+    _, rewards, _, _, infos = env.step(_actions(env, power_action=-0.5))
+    security = env.network.last_metrics.security
+    worst = security.per_uav_eav_rate_bps.max(axis=1)
+    expected = np.maximum(security.per_uav_gu_rate_bps - worst, 0.0)
+    np.testing.assert_allclose(env.secrecy_rate_per_uav_bps, expected)
+    np.testing.assert_allclose(env.latest_metrics["eavesdropper_sum_rate_bps"], worst.sum())
+    for i, agent in enumerate(env.possible_agents):
+        assert infos[agent]["own_secrecy_rate_bps"] == pytest.approx(expected[i])
+        power_cost = env.weights.power * env.uav_power_w[i] / env.sec.max_uav_power_w
+        assert rewards[agent] == pytest.approx(expected.sum() / env.rate_scale_bps - power_cost)
+    assert env.latest_metrics["mean_secrecy_rate_bps_per_gu"] == pytest.approx(expected.sum()/env.n_gu)
 
-    gains = np.array([
-        [4e-10, 1e-10, 2e-10, 1e-10],
-        [2e-10, 3e-10, 1e-10, 2e-10],
-        [1e-10, 2e-10, 3e-10, 1e-10],
-        [2e-10, 1e-10, 2e-10, 3e-10],
-    ])
-
-    w = np.ones(2) / np.sqrt(2)
-
-    h_eav = np.sqrt(gains)[..., None] * w
-
-    fake_state = SimpleNamespace(
-        uav_eav=SimpleNamespace(h=h_eav)
-    )
-    h = fake_state.uav_eav.h
-    fake_state.uav_eav.gain = (
-        np.abs(np.sum(h, axis=-1)) ** 2 / h.shape[-1]
-    )
-    actual = env._eavesdropper_rates(fake_state)
-
-    counts = np.bincount(
-        env.assigned_uav,
-        minlength=env.n_uav,
-    )
-
-    stream_power = env.uav_power_w / counts
-
-    rb = 0
-    u = 0
-
-    active = np.flatnonzero(
-        env.scheduled_gu[:, rb] > 0
-    )
-
-    desired = stream_power[u] * gains[u]
-
-    interference = (
-        np.sum(
-            stream_power[active, None] * gains[active],
-            axis=0,
-        )
-        - desired
-    )
-
-    noise = (
-        env.config.a2a.noise_power_w
-        * env.rb_bandwidth_hz
-        / env.config.a2a.total_bandwidth_hz
-    )
-
-    eav_sinr = desired / (interference + noise)
-
-    expected_rate = np.max(
-        env.rb_bandwidth_hz * np.log2(1 + eav_sinr)
-    )
-
-    gu = env.scheduled_gu[u, rb] - 1
-
-    np.testing.assert_allclose(
-        actual[gu], expected_rate
-    )
-
-    env.close()
-
-def test_secrecy_rate_calculation(monkeypatch):
-    env = SAGINMultiUAVEnv()
-    env.reset(seed=42)
-
-    bandwidth = env.rb_bandwidth_hz
-
-    # Every legitimate GU has SINR = 3.
-    gu_sinr = np.full(env.n_gu, 3.0)
-
-    # First 10 users have stronger EAV links.
-    eav_rates = np.full(env.n_gu, bandwidth)
-    eav_rates[:10] = 3.0 * bandwidth
-
-    monkeypatch.setattr(
-        "environment.a2g_sinr",
-        lambda *args, **kwargs: gu_sinr,
-    )
-
-    monkeypatch.setattr(
-        env,
-        "_eavesdropper_rates",
-        lambda *args, **kwargs: eav_rates,
-    )
-
-    metrics = env._calculate_metrics()
-
-    gu_rates = bandwidth * np.log2(1 + gu_sinr)
-
-    expected = np.maximum(
-        gu_rates - eav_rates,
-        0.0,
-    )
-
-    np.testing.assert_allclose(
-        metrics["secrecy_sum_rate_bps"],
-        np.sum(expected),
-    )
-
-    expected_per_uav = np.bincount(
-        env.assigned_uav,
-        weights=expected,
-        minlength=env.n_uav,
-    )
-
-    np.testing.assert_allclose(
-        env.secrecy_rate_per_uav_bps,
-        expected_per_uav,
-    )
-
-    assert np.all(expected[:10] == 0)
-
-    env.close()
 
 def test_uav_power_budget():
     env = SAGINMultiUAVEnv(
